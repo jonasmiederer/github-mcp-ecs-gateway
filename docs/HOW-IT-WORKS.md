@@ -2,13 +2,27 @@
 
 ## Overview
 
-```
-Kiro (mcp-remote) --Entra token--> AgentCore Gateway --GitHub token, via VPC Lattice--> internal ALB --> MCP server (ECS Fargate) --> api.github.com
-                                        |      ^
-                                        v      |  per-user GitHub token
-                              AgentCore Identity (token vault)
-                                               ^
-                       AgentCore consent portal: user signs in with Entra, clicks "Connect" on GitHub
+```mermaid
+flowchart LR
+    Kiro["Kiro (mcp-remote)"]
+    GW["AgentCore Gateway"]
+    ALB["internal ALB"]
+    MCP["MCP server (ECS Fargate)"]
+    GH["api.github.com"]
+    ID["AgentCore Identity (token vault)"]
+    Portal["AgentCore consent portal<br/>(user signs in with Entra,<br/>clicks Connect on GitHub)"]
+
+    Kiro -- "Entra token" --> GW
+    GW -- "GitHub token, via VPC Lattice" --> ALB
+    ALB --> MCP
+    MCP --> GH
+    GW -- "ask for user's GitHub token" --> ID
+    ID -- "per-user GitHub token" --> GW
+
+    Portal -- "redirect to authorize (scope repo)" --> GH
+    GH -- "authorization code (callback)" --> ID
+    ID -- "back to /connect/callback" --> Portal
+    Portal -- "CompleteResourceTokenAuth, store token" --> ID
 ```
 
 The user signs in twice, once per purpose:
