@@ -1,0 +1,110 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AgentCore Gateway MCP target with GATEWAY-BROKERED GitHub OAuth
+  (Authorization Code / 3LO), side-by-side with the Method 2 target.
+  The Gateway owns GitHub OAuth (OAUTH / AUTHORIZATION_CODE): it runs the 3LO,
+  elicits consent, caches the token and forwards it to the MCP server as a
+  Bearer. Per-user consent + session binding is handled by the AWS-managed
+  AgentCore Identity CONSENT PORTAL: DefaultReturnUrl is the portal's
+  /connect/callback, so the portal calls CompleteResourceTokenAuth — no
+  self-hosted callback, no AWS access for users. The portal must be ACTIVE first
+  (scripts/deploy-portal.py). ListingMode DEFAULT + inline schema because
+  DYNAMIC is incompatible with outbound 3LO, and it lets tools/list work unauthed
+  so the portal can list this target as a Connection.
+  See ../docs/CONSENT-UX-options.md. Registry-verified 2026-09-25.
+
+Parameters:
+  TargetName:
+    Type: String
+    Default: GithubMcp
+    Description: Distinct from the Method 2 target so both can coexist on one gateway.
+  GatewayIdentifier:
+    Type: String
+  McpPrivateEndpoint:
+    Type: String
+    Description: Private HTTPS URL of the internal ALB (e.g. https://mcp.example.com/mcp).
+  VpcId:
+    Type: String
+  PrivateSubnets:
+    Type: CommaDelimitedList
+  LatticeSecurityGroupId:
+    Type: String
+  GitHubProviderArn:
+    Type: String
+    Description: ARN of the AgentCore OAuth2 credential provider (gateway stack output GitHubProviderArn).
+  PortalConnectReturnUrl:
+    Type: String
+    AllowedPattern: "^https://.+/connect/callback$"
+    ConstraintDescription: must be exactly https://<portal-host>/connect/callback (no trailing slash)
+    Description: >
+      Session-binding return URL = EXACTLY <portalUrl>/connect/callback, the
+      consent portal's managed binding endpoint (PORTAL_CONNECT_RETURN_URL in
+      .env, written by scripts/deploy-portal.py). After the user
+      approves on GitHub, AgentCore Identity redirects the browser here and the
+      PORTAL calls CompleteResourceTokenAuth for the authenticated user — no
+      self-hosted callback, no AWS access for end users. If this is missing or
+      wrong, the consent never binds to the portal session and every tools/call
+      re-elicits. Note this is distinct from <portalUrl>/callback (the portal's
+      own IdP login callback, registered on the Entra app, not here).
+  GitHubScope:
+    Type: String
+    Default: repo
+    Description: >
+      SINGLE target-wide scope for ALL tools on this target. Unlike Method 2's
+      per-tool scopes, this target cannot vary scope per tool — this is the documented
+      trade-off. `repo` covers the repo tools; the profile tool is over-scoped as a
+      result.
+
+Resources:
+  McpTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !Ref GatewayIdentifier
+      Name: !Ref TargetName
+      PrivateEndpoint:
+        ManagedVpcResource:
+          VpcIdentifier: !Ref VpcId
+          SubnetIds: !Ref PrivateSubnets
+          SecurityGroupIds: [!Ref LatticeSecurityGroupId]
+          EndpointIpAddressType: IPV4
+      TargetConfiguration:
+        Mcp:
+          McpServer:
+            Endpoint: !Ref McpPrivateEndpoint
+            # DEFAULT (not DYNAMIC): DYNAMIC is incompatible with outbound 3LO.
+            ListingMode: DEFAULT
+            # Schema upfront so tools/list needs no auth; consent fires on tools/call.
+            # For an McpServer target, InlinePayload is a JSON *string* (not a YAML
+            # array) per the registry's McpToolSchemaConfiguration definition.
+            McpToolSchema:
+              InlinePayload: |
+                {"tools":[
+                  {"name":"get_authenticated_user",
+                   "description":"Return the GitHub profile of the calling user.",
+                   "inputSchema":{"type":"object","properties":{}}},
+                  {"name":"list_repositories",
+                   "description":"List repositories the calling user can access.",
+                   "inputSchema":{"type":"object","properties":{
+                     "per_page":{"type":"integer","description":"Max repositories to return (capped at 100)."}}}},
+                  {"name":"get_repository",
+                   "description":"Get metadata for a single repository.",
+                   "inputSchema":{"type":"object","properties":{
+                     "owner":{"type":"string","description":"Repository owner (user or org login)."},
+                     "repo":{"type":"string","description":"Repository name."}},
+                     "required":["owner","repo"]}}
+                ]}
+      # Gateway-brokered GitHub OAuth via Authorization Code (3LO).
+      CredentialProviderConfigurations:
+        - CredentialProviderType: OAUTH
+          CredentialProvider:
+            OauthCredentialProvider:
+              ProviderArn: !Ref GitHubProviderArn
+              Scopes: [!Ref GitHubScope]
+              GrantType: AUTHORIZATION_CODE
+              DefaultReturnUrl: !Ref PortalConnectReturnUrl
+
+Outputs:
+  TargetId:
+    Value: !GetAtt McpTarget.TargetId
+  TargetName:
+    Value: !Ref TargetName

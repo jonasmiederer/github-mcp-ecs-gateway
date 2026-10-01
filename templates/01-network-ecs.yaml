@@ -1,0 +1,265 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  GitHub MCP on ECS (PRIVATE) - VPC, private subnets, INTERNAL ALB (HTTPS with a
+  public ACM cert on a private DNS name), Fargate service. AgentCore Gateway
+  reaches the ALB privately via a VPC Lattice resource gateway it provisions from
+  the target's managedVpcResource block (see the gateway template). No public
+  ingress to the MCP.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: github-mcp-ecs
+  ImageUri:
+    Type: String
+  # Public DNS name you control, used ONLY so ACM can issue a publicly-trusted
+  # cert (the documented private-ALB workaround). The ALB is still internal; this
+  # name resolves to it only inside the VPC via the private hosted zone below.
+  McpDomainName:
+    Type: String
+    Description: e.g. mcp.github-mcp-ecs.example.com (a zone you can DNS-validate).
+  AcmCertificateArn:
+    Type: String
+    Description: Public ACM cert ARN for McpDomainName (issued + validated beforehand).
+
+Resources:
+  # -- Network ----------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.60.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-vpc" }]
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.60.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-private-a" }]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.60.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-private-b" }]
+
+  # Egress path (NAT) so the container can reach GitHub + AWS APIs and pull the
+  # image. No inbound path from the internet to the private subnets.
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties: { Domain: vpc }
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.60.9.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+  Igw:
+    Type: AWS::EC2::InternetGateway
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw }
+  NatGw:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+  PublicRt:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref PublicRt
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+  PublicRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref PublicRt, SubnetId: !Ref PublicSubnet }
+  PrivateRt:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRt
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGw
+  PrivateRtAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref PrivateRt, SubnetId: !Ref PrivateSubnetA }
+  PrivateRtAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { RouteTableId: !Ref PrivateRt, SubnetId: !Ref PrivateSubnetB }
+
+  # -- Security groups ------------------------------------------------------
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal ALB - 443 from inside the VPC only.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.60.0.0/16
+  # SG for the AgentCore-managed Lattice resource-gateway ENIs. Referenced from
+  # the target's managedVpcResource so the Gateway's private path can reach 443.
+  LatticeSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AgentCore Lattice resource gateway ENIs.
+      VpcId: !Ref Vpc
+  AlbIngressFromLattice:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AlbSg
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref LatticeSg
+  ServiceSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MCP task - 8080 from the internal ALB only.
+      VpcId: !Ref Vpc
+  ServiceIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ServiceSg
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref AlbSg
+
+  # -- Internal ALB (private) with HTTPS + public ACM cert ------------------
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-alb"
+      Scheme: internal
+      Type: application
+      SecurityGroups: [!Ref AlbSg]
+      Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 30
+      Matcher: { HttpCode: "200" }
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 443
+      Protocol: HTTPS
+      Certificates: [{ CertificateArn: !Ref AcmCertificateArn }]
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # -- Private DNS: McpDomainName resolves to the internal ALB inside the VPC -
+  PrivateZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref McpDomainName
+      VPCs:
+        - VPCId: !Ref Vpc
+          VPCRegion: !Ref AWS::Region
+  AlbAliasRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateZone
+      Name: !Ref McpDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Alb.DNSName
+        HostedZoneId: !GetAtt Alb.CanonicalHostedZoneID
+
+  # -- ECS ------------------------------------------------------------------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties: { ClusterName: !Sub "${ProjectName}-cluster" }
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}"
+      RetentionInDays: 14
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # No task role: the server calls no AWS API. The gateway forwards the user's
+  # GitHub token, and the server only calls api.github.com with it.
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-task"
+      Cpu: "512"
+      Memory: "1024"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: mcp
+          Image: !Ref ImageUri
+          PortMappings: [{ ContainerPort: 8080 }]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: mcp
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: HttpsListener
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: 1
+      TaskDefinition: !Ref TaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+          SecurityGroups: [!Ref ServiceSg]
+      LoadBalancers:
+        - ContainerName: mcp
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+  PrivateSubnets:
+    Value: !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+  LatticeSecurityGroupId:
+    Description: Pass to the gateway stack's LatticeSecurityGroupId.
+    Value: !Ref LatticeSg
+  McpPrivateEndpoint:
+    Description: Private HTTPS MCP URL - pass to the gateway stack's McpPrivateEndpoint.
+    Value: !Sub "https://${McpDomainName}/mcp"
+  InternalAlbDns:
+    Value: !GetAtt Alb.DNSName

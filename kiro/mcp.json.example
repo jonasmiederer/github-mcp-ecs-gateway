@@ -1,0 +1,18 @@
+{
+  "// note": "Single-app design: one Entra app registration is BOTH the audience (API) and the Kiro client. Kiro connects via the mcp-remote stdio proxy because its native remote-MCP OAuth client sends the RFC 8707 resource param, which Entra rejects (AADSTS9010010). Replace <gateway-url> with the GatewayUrl output of the github-mcp-ecs-oc-gateway stack and <app-id> with ENTRA_API_APP_ID.",
+  "mcpServers": {
+    "github-oc-mcp": {
+      "command": "npx",
+      "args": [
+        "mcp-remote@latest",
+        "<gateway-url>",
+        "7788",
+        "--disable-resource-parameter",
+        "--static-oauth-client-info",
+        "{\"client_id\":\"<app-id>\"}",
+        "--static-oauth-client-metadata",
+        "{\"scope\":\"openid profile offline_access api://<app-id>/mcp.invoke\"}"
+      ]
+    }
+  }
+}

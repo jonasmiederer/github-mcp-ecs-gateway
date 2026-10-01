@@ -1,0 +1,464 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  github-mcp-ecs / gateway - AgentCore Gateway + Identity. Gateway-brokered
+  GitHub 3LO (AUTHORIZATION_CODE) with per-user consent handled by the
+  AWS-managed AgentCore Identity CONSENT PORTAL - no self-hosted callback. This
+  stack owns: the GitHub outbound OAuth2 provider, the Entra primary-IdP provider
+  the portal signs users in with, the portal's execution role, the Gateway (MCP
+  2025-11-25, sessions + streaming for URL-mode elicitation, Entra CUSTOM_JWT
+  inbound), gateway APPLICATION_LOGS, and an optional RESPONSE interceptor that
+  rewrites the -32042 elicitation URL to the portal so ANY MCP client (Kiro) is
+  steered through it. The consent portal itself has no CloudFormation type yet
+  and is created by scripts/deploy-portal.py. Pattern follows awslabs
+  amazon-bedrock-agentcore-samples 07-consent-portal-auth-code-flow-targets.
+  CFN property names verified against the live registry 2026-09-25.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: github-mcp-ecs
+    Description: Name prefix for the gateway resources.
+  McpSupportedVersion:
+    Type: String
+    Default: "2025-11-25"
+    Description: MCP protocol version for the gateway; 2025-11-25+ is required for 3LO elicitation.
+  McpSessionTimeoutSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 900
+    MaxValue: 28800
+    Description: >
+      MCP session timeout. Sessions are required for URL-mode elicitation so the
+      gateway can correlate the client's elicitation/complete notification. Must
+      comfortably exceed the 10-minute validity of the authorize URL.
+
+  # -- GitHub OAuth App (OUTBOUND provider: what the agent acts ON) ----------
+  GitHubProviderName:
+    Type: String
+    Default: github-mcp-provider
+    Description: >
+      Name of the GitHub provider. Shown to end users on the consent portal's
+      Connections page - keep it readable.
+  GitHubClientId:
+    Type: String
+  GitHubClientSecretArn:
+    Type: String
+    Description: Secrets Manager ARN holding the GitHub OAuth App client secret.
+  GitHubClientSecretJsonKey:
+    Type: String
+    Default: client_secret
+    Description: JSON key inside the secret (store as {"client_secret":"..."}).
+
+  # -- Entra (inbound authorizer AND the portal's primary IdP) --------------
+  EntraTenantId:
+    Type: String
+  EntraApiAppId:
+    Type: String
+    Description: >
+      Single-app design - this GUID is the gateway audience, the Kiro public
+      client, AND the consent portal's login client. Sharing one audience is
+      what makes the Entra `sub` (pairwise on `aud`) identical between the
+      portal sign-in and the gateway call, so consent granted on the portal is
+      found when the gateway looks it up.
+  EntraPortalClientSecretArn:
+    Type: String
+    Description: >
+      Secrets Manager ARN holding a CLIENT SECRET for the Entra app
+      (EntraApiAppId). The portal signs users in server-side as this app and
+      exchanges the auth code with a secret; the Kiro public-client PKCE flow
+      does not use it. Store as {"client_secret":"..."}.
+  EntraPortalClientSecretJsonKey:
+    Type: String
+    Default: client_secret
+  EntraIdpProviderName:
+    Type: String
+    Default: github-mcp-portal-idp
+    Description: Name of the primary-IdP credential provider the consent portal uses.
+
+  # -- Consent portal wiring (set AFTER scripts/deploy-portal.py) ----
+  PortalUrl:
+    Type: String
+    Default: ""
+    Description: >
+      Absolute https URL of the consent portal
+      (https://<gateway-id>.consent-portal.<region>.amazonaws.com). Leave EMPTY
+      on the first deploy - the portal cannot exist before the gateway. After
+      deploy-portal.py writes PORTAL_URL to .env, redeploy with it set:
+      that attaches the RESPONSE interceptor so elicitations carry the portal
+      URL instead of the raw AgentCore Identity authorize URL.
+  PortalArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of the consent portal (PORTAL_ARN in .env, written by
+      deploy-portal.py). Empty on the first pass; set on the second
+      pass, it pins the portal execution role's trust (aws:SourceArn) to this
+      one portal instead of any consent portal in the account.
+  InterceptorMode:
+    Type: String
+    Default: REWRITE
+    AllowedValues: [REWRITE, LOG_ONLY]
+    Description: >
+      REWRITE swaps the identity URL for PortalUrl on -32042 elicitations.
+      LOG_ONLY passes everything through and logs the full interceptor event -
+      use it if the elicitation payload shape ever changes and the rewrite
+      stops matching.
+
+Conditions:
+  HasPortalUrl: !Not [!Equals [!Ref PortalUrl, ""]]
+  HasPortalArn: !Not [!Equals [!Ref PortalArn, ""]]
+
+Resources:
+  # -- GitHub OAuth2 credential provider (OUTBOUND) -----------
+  GitHubOAuth2Provider:
+    Type: AWS::BedrockAgentCore::OAuth2CredentialProvider
+    Properties:
+      Name: !Ref GitHubProviderName
+      CredentialProviderVendor: CustomOauth2
+      Oauth2ProviderConfigInput:
+        CustomOauth2ProviderConfig:
+          OauthDiscovery:
+            AuthorizationServerMetadata:
+              Issuer: https://github.com
+              AuthorizationEndpoint: https://github.com/login/oauth/authorize
+              TokenEndpoint: https://github.com/login/oauth/access_token
+              ResponseTypes: [code]
+          ClientId: !Ref GitHubClientId
+          ClientSecretSource: EXTERNAL
+          ClientSecretConfig:
+            SecretId: !Ref GitHubClientSecretArn
+            JsonKey: !Ref GitHubClientSecretJsonKey
+
+  # -- Entra PRIMARY-IdP credential provider (who users sign in AS) -----------
+  # Distinct from the GitHub provider above. The portal needs a provider that
+  # issues JWT access tokens (GitHub cannot - no ID token, no OIDC discovery).
+  # Vendor is CustomOauth2 rather than MicrosoftOauth2 on purpose: the Microsoft
+  # config takes only a tenantId and gives nowhere to state the discovery URL,
+  # and with Entra the /v2.0/ discovery document is the thing that has to be
+  # right (v1 advertises iss=sts.windows.net, which mismatches v2 tokens).
+  EntraIdpProvider:
+    Type: AWS::BedrockAgentCore::OAuth2CredentialProvider
+    Properties:
+      Name: !Ref EntraIdpProviderName
+      CredentialProviderVendor: CustomOauth2
+      Oauth2ProviderConfigInput:
+        CustomOauth2ProviderConfig:
+          OauthDiscovery:
+            DiscoveryUrl: !Sub "https://login.microsoftonline.com/${EntraTenantId}/v2.0/.well-known/openid-configuration"
+          ClientId: !Ref EntraApiAppId
+          ClientSecretSource: EXTERNAL
+          ClientSecretConfig:
+            SecretId: !Ref EntraPortalClientSecretArn
+            JsonKey: !Ref EntraPortalClientSecretJsonKey
+
+  # -- Consent portal execution role ------------------------------------------
+  # Assumed by the managed portal to read this gateway + its targets and the
+  # credential providers, and to perform the token operations (including
+  # CompleteResourceTokenAuth - the session-binding call the portal does FOR
+  # the user, so users never need AWS access). Permissions mirror the AgentCore
+  # developer guide / awslabs sample.
+  #
+  # Trust is scoped to consent portals in THIS account+region (consent-portal/*)
+  # on the first pass, because the portal is created after this stack. The
+  # second pass (PortalArn set) pins aws:SourceArn to the real portal ARN, so
+  # CloudFormation owns the final trust policy and drift detection stays clean.
+  PortalExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-consent-portal-role"
+      Description: Execution role for the AgentCore Identity consent portal fronting this gateway.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ConsentPortalAssumeRolePolicy
+            Effect: Allow
+            Principal: { Service: bedrock-agentcore.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !If
+                  - HasPortalArn
+                  - !Ref PortalArn
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:consent-portal/*"
+      Policies:
+        - PolicyName: ConsentPortalAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadThisGateway
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetGateway
+                  - bedrock-agentcore:GetGatewayTarget
+                  - bedrock-agentcore:ListGatewayTargets
+                Resource: !GetAtt Gateway.GatewayArn
+              - Sid: ReadCredentialProviders
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetOauth2CredentialProvider
+                  - bedrock-agentcore:ListOauth2CredentialProviders
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default"
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/default/oauth2credentialprovider/*"
+              # token-vault/* also covers .../oauth2credentialprovider/*, and
+              # workload-identity-directory/* covers .../workload-identity/*,
+              # because an IAM wildcard spans "/".
+              - Sid: TokenOperations
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:CompleteResourceTokenAuth
+                  - bedrock-agentcore:GetResourceOauth2Token
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:token-vault/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/*"
+              # The identity service's own managed OAuth secrets (tag-conditioned).
+              - Sid: ReadIdentityManagedSecrets
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:bedrock-agentcore-identity!default/oauth2/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/aws:secretsmanager:owningService: bedrock-agentcore-identity
+              # Both providers here use EXTERNAL (customer-managed) secrets, and
+              # the portal must be able to read them (blog: "can read any
+              # customer-managed secrets referenced by the outbound providers").
+              - Sid: ReadCustomerManagedProviderSecrets
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref GitHubClientSecretArn
+                  - !Ref EntraPortalClientSecretArn
+
+  # -- Gateway service role --------------------------------------------------
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock-agentcore.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: gateway-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Gateway-brokered 3LO: the gateway obtains per-user tokens, so it
+              # needs the token operations. GetWorkloadAccessTokenForJWT is
+              # REQUIRED: the gateway exchanges the inbound Entra JWT for a
+              # workload-identity token before fetching the outbound GitHub
+              # token. Without it the fetch fails 403 and surfaces to the client
+              # as a generic "internal error".
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                  - bedrock-agentcore:GetWorkloadAccessTokenForUserId
+                  - bedrock-agentcore:GetResourceOauth2Token
+                  - bedrock-agentcore:CompleteResourceTokenAuth
+                Resource: "*"
+        # Scoped invoke grant for the RESPONSE interceptor, as its own policy so
+        # it never collides with the runtime policy above.
+        - PolicyName: InterceptorInvoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt InterceptorFunction.Arn
+
+  # -- Gateway (INBOUND = Entra), MCP 2025-11-25 for URL-mode elicitation ----
+  Gateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: !Sub "${ProjectName}-gw"
+      ProtocolType: MCP
+      ProtocolConfiguration:
+        Mcp:
+          SupportedVersions:
+            - !Ref McpSupportedVersion
+          # URL-mode elicitation (the -32042 consent prompt Kiro renders)
+          # requires BOTH of these at MCP 2025-11-25.
+          SessionConfiguration:
+            SessionTimeoutInSeconds: !Ref McpSessionTimeoutSeconds
+          StreamingConfiguration:
+            EnableResponseStreaming: true
+      RoleArn: !GetAtt GatewayRole.Arn
+      AuthorizerType: CUSTOM_JWT
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub "https://login.microsoftonline.com/${EntraTenantId}/v2.0/.well-known/openid-configuration"
+          AllowedAudience:
+            - !Ref EntraApiAppId
+      # Attached only once PortalUrl is known (second deploy). A gateway has at
+      # most one RESPONSE interceptor. passRequestHeaders=false keeps the
+      # caller's JWT out of the interceptor event - and out of CloudWatch in
+      # LOG_ONLY mode.
+      InterceptorConfigurations: !If
+        - HasPortalUrl
+        - - Interceptor:
+              Lambda:
+                Arn: !GetAtt InterceptorFunction.Arn
+            InterceptionPoints: [RESPONSE]
+            InputConfiguration:
+              PassRequestHeaders: false
+        - !Ref AWS::NoValue
+
+  # -- RESPONSE interceptor: rewrite the -32042 elicitation URL -> portal -----
+  # When an unconsented user invokes a tool, the gateway answers with a URL-mode
+  # elicitation carrying an AgentCore Identity authorize URL. Following that URL
+  # directly bypasses the portal's session binding (there is nothing to call
+  # CompleteResourceTokenAuth for the user). The interceptor swaps it for the
+  # portal URL, so every MCP client on this gateway is steered to the portal:
+  # sign in with Entra -> Connect GitHub -> return to Kiro and retry.
+  #
+  # Payload shape confirmed live in the awslabs sample: NOT a streaming
+  # elicitation/create - a JSON-RPC error on the tools/call response,
+  # body.error.code == -32042, URLs at body.error.data.elicitations[*].url.
+  # The handler is stateless (the gateway may retry it) and passes every
+  # non-elicitation response through untouched.
+  InterceptorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  InterceptorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-consent-jit-interceptor"
+      RetentionInDays: 14
+
+  InterceptorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-consent-jit-interceptor"
+      Description: AgentCore Gateway RESPONSE interceptor - rewrites the 3LO elicitation URL to the consent portal.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt InterceptorRole.Arn
+      # The gateway waits on this on EVERY response - keep it small.
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          INTERCEPTOR_MODE: !Ref InterceptorMode
+          PORTAL_URL: !Ref PortalUrl
+          IDENTITY_URL_HOST: bedrock-agentcore
+      Code:
+        ZipFile: |
+          import json, logging, os
+          log = logging.getLogger(); log.setLevel(logging.INFO)
+          MODE = os.environ.get("INTERCEPTOR_MODE", "REWRITE").upper()
+          PORTAL_URL = os.environ.get("PORTAL_URL", "")
+          HOST = os.environ.get("IDENTITY_URL_HOST", "bedrock-agentcore")
+          VER = "1.0"; ELICIT = -32042
+
+          def _req(body):
+              return {"interceptorOutputVersion": VER,
+                      "mcp": {"transformedGatewayRequest": {"body": body}}}
+
+          def _resp(body, status):
+              t = {"body": body}
+              if status is not None:
+                  t["statusCode"] = status
+              return {"interceptorOutputVersion": VER,
+                      "mcp": {"transformedGatewayResponse": t}}
+
+          def _is_identity_url(v):
+              return isinstance(v, str) and v.startswith(("http://", "https://")) and HOST in v
+
+          def rewrite(body, portal):
+              err = body.get("error"); data = err.get("data") if isinstance(err, dict) else None
+              els = data.get("elicitations") if isinstance(data, dict) else None
+              if not isinstance(els, list):
+                  return 0
+              n = 0
+              for e in els:
+                  if isinstance(e, dict) and e.get("mode") == "url" and _is_identity_url(e.get("url")):
+                      e["url"] = portal; n += 1
+              return n
+
+          def lambda_handler(event, context):
+              if MODE == "LOG_ONLY":
+                  log.info("INTERCEPTOR_EVENT %s", json.dumps(event, default=str))
+              mcp = event.get("mcp", {})
+              gr = mcp.get("gatewayResponse")
+              if not gr:
+                  return _req(mcp.get("gatewayRequest", {}).get("body", {}))
+              body = gr.get("body", {}); status = gr.get("statusCode")
+              is_el = isinstance(body, dict) and isinstance(body.get("error"), dict) \
+                  and body["error"].get("code") == ELICIT
+              if MODE == "REWRITE" and is_el:
+                  if not PORTAL_URL:
+                      log.warning("REWRITE mode but PORTAL_URL empty; passing through")
+                  else:
+                      n = rewrite(body, PORTAL_URL)
+                      log.info("CONSENT_ELICITATION rewrote %d identity URL(s) to the portal", n)
+                      if n == 0:
+                          log.warning("-32042 matched no URL; payload shape may have changed. Redeploy LOG_ONLY.")
+              return _resp(body, status)
+
+  # -- Gateway APPLICATION_LOGS -> CloudWatch (vended-logs delivery pipeline) ---
+  # AgentCore gateways don't emit logs by default. Without this, gateway-side
+  # errors (e.g. a 3LO token-exchange 403 behind an "internal error") are
+  # invisible.
+  GatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/vendedlogs/bedrock-agentcore/gateway/APPLICATION_LOGS/${Gateway.GatewayIdentifier}"
+      RetentionInDays: 30
+
+  GatewayLogDeliverySource:
+    Type: AWS::Logs::DeliverySource
+    Properties:
+      Name: !Sub "${ProjectName}-gw-logs-source"
+      ResourceArn: !GetAtt Gateway.GatewayArn
+      LogType: APPLICATION_LOGS
+
+  GatewayLogDeliveryDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Properties:
+      Name: !Sub "${ProjectName}-gw-logs-destination"
+      DestinationResourceArn: !GetAtt GatewayLogGroup.Arn
+
+  GatewayLogDelivery:
+    Type: AWS::Logs::Delivery
+    Properties:
+      DeliverySourceName: !Ref GatewayLogDeliverySource
+      DeliveryDestinationArn: !GetAtt GatewayLogDeliveryDestination.Arn
+
+Outputs:
+  GatewayUrl:
+    Description: MCP endpoint clients (Kiro) connect to.
+    Value: !GetAtt Gateway.GatewayUrl
+  GatewayIdentifier:
+    Description: >
+      For the target stack and as the consent portal's source. The
+      portal hostname is derived from THIS id:
+      <gateway-id>.consent-portal.<region>.amazonaws.com.
+    Value: !GetAtt Gateway.GatewayIdentifier
+  GatewayArn:
+    Value: !GetAtt Gateway.GatewayArn
+  GitHubProviderArn:
+    Description: Outbound provider ARN - providerArn on the gateway target.
+    Value: !GetAtt GitHubOAuth2Provider.CredentialProviderArn
+  EntraIdpProviderArn:
+    Description: Primary-IdP provider ARN - idpConfig.credentialProviderArn on the consent portal.
+    Value: !GetAtt EntraIdpProvider.CredentialProviderArn
+  PortalExecutionRoleArn:
+    Description: executionRoleArn for CreateConsentPortal.
+    Value: !GetAtt PortalExecutionRole.Arn
+  PortalExecutionRoleName:
+    Value: !Ref PortalExecutionRole
+  InterceptorFunctionArn:
+    Value: !GetAtt InterceptorFunction.Arn
