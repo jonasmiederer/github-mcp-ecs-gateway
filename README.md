@@ -1,4 +1,4 @@
-# GitHub MCP on ECS behind AgentCore Gateway + Identity, Entra ID only
+# GitHub MCP for Kiro: ECS behind AgentCore Gateway + Identity, Entra ID
 
 ```mermaid
 flowchart LR
